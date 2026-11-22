@@ -15,5 +15,10 @@
     "depends": [
       "jq"
     ]
+  },
+  "firefox": {
+    "version": "latest",
+    "url": "packages/amd64/firefox-latest-amd64.tar.xz",
+    "depends": []
   }
 }
