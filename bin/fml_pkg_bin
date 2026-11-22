@@ -10,7 +10,7 @@ import urllib.request
 from pathlib import Path
 
 CONFIG_FILE = Path("/etc/fml_pkg_bin.conf")
-DEFAULT_REPO = "https://raw.githubusercontent.com/Rearh/FPB/"
+DEFAULT_REPO = "https://raw.githubusercontent.com/Rearh/FPB/main/"
 DB_DIR = Path("/var/lib/fml_pkg_bin")
 REPO_CACHE = DB_DIR / "repo.json"
 INSTALLED_DB = DB_DIR / "installed.json"
