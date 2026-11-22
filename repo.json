@@ -3,5 +3,17 @@
     "version": "2.31.0",
     "url": "packages/amd64/fastfetch-2.31.0-amd64.tar.xz",
     "depends": []
+  },
+  "jq": {
+    "version": "1.7.1",
+    "url": "packages/amd64/jq-1.7.1-amd64.tar.xz",
+    "depends": []
+  },
+  "fzf": {
+    "version": "0.56.3",
+    "url": "packages/amd64/fzf-0.56.3-amd64.tar.xz",
+    "depends": [
+      "jq"
+    ]
   }
 }
