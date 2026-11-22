@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shutil
+import sys
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
+CONFIG_FILE = Path("/etc/fml_pkg_bin.conf")
+DEFAULT_REPO = "https://githubusercontent.com"
+DB_DIR = Path("/var/lib/fml_pkg_bin")
+REPO_CACHE = DB_DIR / "repo.json"
+INSTALLED_DB = DB_DIR / "installed.json"
+MANIFESTS_DIR = DB_DIR / "manifests"
+
+
+def get_repo_url() -> str:
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("REPO_URL="):
+                return line.split("=", 1)[1].strip('"\'')
+    return DEFAULT_REPO
+
+
+def init_db():
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not INSTALLED_DB.exists():
+        INSTALLED_DB.write_text("{}")
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def save_json(path: Path, data: dict):
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def sync_repo():
+    init_db()
+    url = f"{get_repo_url()}/repo.json"
+    print(f"[*] Синхронизация с {url}...")
+    try:
+        urllib.request.urlretrieve(url, REPO_CACHE)
+        print("[+] Репозиторий успешно обновлён.")
+    except Exception as e:
+        print(f"[!] Ошибка синхронизации: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def resolve_pkg_url(raw_url: str) -> str:
+    if raw_url.startswith(("http://", "https://")):
+        return raw_url
+    return f"{get_repo_url()}/{raw_url.lstrip('/')}"
+
+
+def install_pkg(pkg_name: str, visited: set = None):
+    init_db()
+    if visited is None:
+        visited = set()
+
+    if pkg_name in visited:
+        print(f"[!] Циклическая зависимость на пакете '{pkg_name}'!", file=sys.stderr)
+        sys.exit(1)
+    visited.add(pkg_name)
+
+    repo = load_json(REPO_CACHE)
+    if not repo:
+        print("[!] Кэш пуст. Сначала выполни: fml_pkg_bin sync", file=sys.stderr)
+        sys.exit(1)
+
+    if pkg_name not in repo:
+        print(f"[!] Пакет '{pkg_name}' не найден в репозитории.", file=sys.stderr)
+        sys.exit(1)
+
+    pkg_info = repo[pkg_name]
+    installed_db = load_json(INSTALLED_DB)
+
+    # Рекурсивно устанавливаем все зависимости
+    deps = pkg_info.get("depends", [])
+    for dep in deps:
+        if dep not in installed_db:
+            print(f"[*] Требуется зависимость '{dep}' для '{pkg_name}'...")
+            install_pkg(dep, visited.copy())
+
+    installed_db = load_json(INSTALLED_DB)
+    version = pkg_info["version"]
+
+    if pkg_name in installed_db and installed_db[pkg_name]["version"] == version:
+        print(f"[=] {pkg_name} ({version}) уже установлен.")
+        return
+
+    archive_url = resolve_pkg_url(pkg_info["url"])
+    print(f"[*] Установка {pkg_name} ({version})...")
+
+    with tempfile.TemporaryDirectory(prefix=f"fml_pkg_bin-{pkg_name}-") as tmpdir:
+        tmp_path = Path(tmpdir)
+        archive_path = tmp_path / "pkg.tar.xz"
+        extract_dir = tmp_path / "root"
+        extract_dir.mkdir()
+
+        try:
+            urllib.request.urlretrieve(archive_url, archive_path)
+        except Exception as e:
+            print(f"[!] Ошибка скачивания ({archive_url}): {e}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            with tarfile.open(archive_path, "r:*") as tar:
+                tar.extractall(path=extract_dir, filter="fully_trusted")
+        except TypeError:
+            with tarfile.open(archive_path, "r:*") as tar:
+                tar.extractall(path=extract_dir)
+        except Exception as e:
+            print(f"[!] Ошибка распаковки архива: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        installed_files = []
+        for root, dirs, files in os.walk(extract_dir):
+            rel_root = Path(root).relative_to(extract_dir)
+            target_root = Path("/") / rel_root
+            target_root.mkdir(parents=True, exist_ok=True)
+
+            for item in files + [d for d in dirs if (Path(root) / d).is_symlink()]:
+                src = Path(root) / item
+                dst = target_root / item
+                if dst.exists() or dst.is_symlink():
+                    if not dst.is_dir() or dst.is_symlink():
+                        dst.unlink()
+                if src.is_symlink():
+                    os.symlink(os.readlink(src), dst)
+                else:
+                    shutil.copy2(src, dst)
+                installed_files.append(str(dst))
+
+        manifest_file = MANIFESTS_DIR / f"{pkg_name}.list"
+        if pkg_name in installed_db and manifest_file.exists():
+            old_files = set(manifest_file.read_text().splitlines())
+            for old_f in old_files - set(installed_files):
+                p = Path(old_f)
+                if p.exists() or p.is_symlink():
+                    p.unlink()
+
+        manifest_file.write_text("\n".join(installed_files) + "\n")
+        installed_db[pkg_name] = {"version": version, "depends": deps}
+        save_json(INSTALLED_DB, installed_db)
+
+    print(f"[+] Пакет {pkg_name} ({version}) установлен ({len(installed_files)} файлов).")
+
+
+def remove_pkg(pkg_name: str):
+    init_db()
+    installed_db = load_json(INSTALLED_DB)
+    if pkg_name not in installed_db:
+        print(f"[!] Пакет '{pkg_name}' не установлен.", file=sys.stderr)
+        sys.exit(1)
+
+    dependents = [
+        p for p, info in installed_db.items()
+        if pkg_name in info.get("depends", []) and p != pkg_name
+    ]
+    if dependents:
+        print(f"[!] Внимание: от '{pkg_name}' зависят пакеты: {', '.join(dependents)}")
+
+    manifest_file = MANIFESTS_DIR / f"{pkg_name}.list"
+    if not manifest_file.exists():
+        print(f"[!] Манифест '{pkg_name}' не найден.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[*] Удаление {pkg_name}...")
+    dirs_to_check = set()
+    for f_str in manifest_file.read_text().splitlines():
+        p = Path(f_str)
+        dirs_to_check.add(p.parent)
+        if p.exists() or p.is_symlink():
+            p.unlink()
+
+    for d in sorted(dirs_to_check, key=lambda x: len(x.parts), reverse=True):
+        try:
+            if d != Path("/") and d.exists() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
+    manifest_file.unlink()
+    del installed_db[pkg_name]
+    save_json(INSTALLED_DB, installed_db)
+    print(f"[+] Пакет {pkg_name} удалён.")
+
+
+def update_pkgs(target_pkg: str = None):
+    init_db()
+    sync_repo()
+    repo = load_json(REPO_CACHE)
+    installed_db = load_json(INSTALLED_DB)
+
+    if not installed_db:
+        print("[*] Установленных пакетов нет.")
+        return
+
+    pkgs = [target_pkg] if target_pkg else list(installed_db.keys())
+    updated = 0
+    for pkg in pkgs:
+        if pkg not in installed_db:
+            print(f"[!] '{pkg}' не установлен.")
+            continue
+        if pkg not in repo:
+            print(f"[!] '{pkg}' нет в репо, пропуск.")
+            continue
+        if installed_db[pkg]["version"] != repo[pkg]["version"]:
+            print(f"[*] Обновление {pkg}: {installed_db[pkg]['version']} -> {repo[pkg]['version']}")
+            install_pkg(pkg)
+            updated += 1
+        else:
+            print(f"[=] {pkg} актуален ({installed_db[pkg]['version']}).")
+    print(f"[+] Готово. Обновлено: {updated}.")
+
+
+def main():
+    if os.geteuid() != 0:
+        print("[!] Нужны права root.", file=sys.stderr)
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(prog="fml_pkg_bin", description="Бинарный пакетник (amd64) для LFS")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("sync", help="Обновить индекс пакетов")
+
+    p_in = sub.add_parser("install", help="Установить пакет с зависимостями")
+    p_in.add_argument("package")
+
+    p_rm = sub.add_parser("remove", help="Удалить пакет")
+    p_rm.add_argument("package")
+
+    p_up = sub.add_parser("update", help="Обновить пакеты")
+    p_up.add_argument("package", nargs="?", default=None)
+
+    args = parser.parse_args()
+    if args.cmd == "sync":
+        sync_repo()
+    elif args.cmd == "install":
+        install_pkg(args.package)
+    elif args.cmd == "remove":
+        remove_pkg(args.package)
+    elif args.cmd == "update":
+        update_pkgs(args.package)
+
+
+if __name__ == "__main__":
+    main()
